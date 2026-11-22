@@ -1,20 +1,42 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 
 	"github.com/consensys/gnark-crypto/ecc"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr/poseidon2"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/backend/witness"
 	"github.com/consensys/gnark/constraint"
+	csbn254 "github.com/consensys/gnark/constraint/bn254"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/std/algebra/emulated/sw_bn254"
 	stdgroth16 "github.com/consensys/gnark/std/recursion/groth16"
 )
 
+const leafCount = 4
+
 var field = ecc.BN254.ScalarField()
+
+// referenceChain computes H repeatedly, starting at 1. Each call to H hashes
+// one canonical field element from the zero initial state.
+func referenceChain() ([]fr.Element, error) {
+	chain := make([]fr.Element, leafCount*hashesPerLeaf+1)
+	chain[0].SetOne()
+	hasher := poseidon2.NewMerkleDamgardHasher()
+	for i := 1; i < len(chain); i++ {
+		hasher.Reset()
+		if _, err := hasher.Write(chain[i-1].Marshal()); err != nil {
+			return nil, fmt.Errorf("hash reference chain step %d: %w", i, err)
+		}
+		chain[i].SetBytes(hasher.Sum(nil))
+	}
+	return chain, nil
+}
 
 type proofLevel struct {
 	constraints  constraint.ConstraintSystem
@@ -55,12 +77,16 @@ func (level proofLevel) parent() (*parentCircuit, error) {
 	return &parentCircuit{Left: placeholder(), Right: placeholder(), ChildKey: key}, nil
 }
 
-func (level proofLevel) prove(assignment frontend.Circuit, expected publicState) (provedStatement, error) {
+func (level proofLevel) prove(assignment frontend.Circuit) (groth16.Proof, error) {
 	full, err := frontend.NewWitness(assignment, field)
 	if err != nil {
-		return provedStatement{}, fmt.Errorf("build prover witness: %w", err)
+		return nil, fmt.Errorf("build prover witness: %w", err)
 	}
-	proof, err := groth16.Prove(level.constraints, level.provingKey, full, stdgroth16.GetNativeProverOptions(field, field))
+	return groth16.Prove(level.constraints, level.provingKey, full, stdgroth16.GetNativeProverOptions(field, field))
+}
+
+func (level proofLevel) proveAndVerify(assignment frontend.Circuit, expected publicState) (provedStatement, error) {
+	proof, err := level.prove(assignment)
 	if err != nil {
 		return provedStatement{}, fmt.Errorf("prove: %w", err)
 	}
@@ -88,21 +114,28 @@ func (p provedStatement) child() (childProof, error) {
 }
 
 func run() error {
+	chain, err := referenceChain()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Poseidon2 H(1)=%s\n", chain[1].String())
+
 	level, err := setupLevel(0, &leafCircuit{})
 	if err != nil {
 		return err
 	}
-	children := make([]provedStatement, 4)
+	children := make([]provedStatement, leafCount)
 	for i := range children {
-		state := publicState{Start: i + 1, End: i + 2, Height: 0, Count: 1}
-		children[i], err = level.prove(&leafCircuit{State: state}, state)
+		start := i * hashesPerLeaf
+		state := publicState{Start: chain[start], End: chain[start+hashesPerLeaf], Height: 0, Count: 1}
+		children[i], err = level.proveAndVerify(&leafCircuit{State: state}, state)
 		if err != nil {
 			return fmt.Errorf("leaf %d: %w", i+1, err)
 		}
 	}
-	fmt.Println("Verified 4 leaf proofs")
+	fmt.Printf("Verified N=1 start=1 end=%s height=0 count=1 (%d hashes)\n", chain[hashesPerLeaf].String(), hashesPerLeaf)
 
-	for height := 1; height <= 2; height++ {
+	for height := 1; len(children) > 1; height++ {
 		circuit, err := level.parent()
 		if err != nil {
 			return fmt.Errorf("build level %d circuit: %w", height, err)
@@ -122,14 +155,31 @@ func run() error {
 			if err != nil {
 				return fmt.Errorf("convert right child at level %d: %w", height, err)
 			}
-			start := i*count + 1
-			state := publicState{Start: start, End: start + count, Height: height, Count: count}
+			start := i * count * hashesPerLeaf
+			end := start + count*hashesPerLeaf
+			state := publicState{Start: chain[start], End: chain[end], Height: height, Count: count}
 			fmt.Printf("Proving level %d proof %d of %d\n", height, i+1, len(parents))
-			parents[i], err = level.prove(&parentCircuit{State: state, Left: left, Right: right}, state)
+			parents[i], err = level.proveAndVerify(&parentCircuit{State: state, Left: left, Right: right}, state)
 			if err != nil {
 				return fmt.Errorf("level %d proof %d: %w", height, i+1, err)
 			}
-			fmt.Printf("Verified start=%v end=%v height=%v count=%v\n", state.Start, state.End, state.Height, state.Count)
+			if i == 0 {
+				fmt.Printf("Verified N=%d start=1 end=%s height=%d count=%d (%d hashes)\n", count, chain[end].String(), height, count, end)
+			}
+			if height == 1 && i == 0 {
+				// Reverse the two verified leaves. Both outer endpoints are x_8,
+				// but the join would require x_16 to equal x_0.
+				reversed := publicState{Start: chain[hashesPerLeaf], End: chain[hashesPerLeaf], Height: 1, Count: 2}
+				_, err := level.prove(&parentCircuit{State: reversed, Left: right, Right: left})
+				if err == nil {
+					return errors.New("proved a parent with mismatched child endpoints")
+				}
+				var unsatisfied *csbn254.UnsatisfiedConstraintError
+				if !errors.As(err, &unsatisfied) {
+					return fmt.Errorf("prove mismatched children: %w", err)
+				}
+				fmt.Printf("Rejected two valid leaves with a mismatched join at constraint %d\n", unsatisfied.CID)
+			}
 		}
 		children = parents
 	}

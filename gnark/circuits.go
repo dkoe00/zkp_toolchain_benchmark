@@ -3,9 +3,12 @@ package main
 import (
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/std/algebra/emulated/sw_bn254"
+	"github.com/consensys/gnark/std/hash/poseidon2"
 	"github.com/consensys/gnark/std/math/emulated"
 	stdgroth16 "github.com/consensys/gnark/std/recursion/groth16"
 )
+
+const hashesPerLeaf = 8
 
 // Keep this order in sync with the public input indexes in parentCircuit.
 type publicState struct {
@@ -20,7 +23,17 @@ type leafCircuit struct {
 }
 
 func (c *leafCircuit) Define(api frontend.API) error {
-	api.AssertIsEqual(c.State.End, api.Add(c.State.Start, 1))
+	hasher, err := poseidon2.New(api)
+	if err != nil {
+		return err
+	}
+	current := c.State.Start
+	for range hashesPerLeaf {
+		hasher.Reset()
+		hasher.Write(current)
+		current = hasher.Sum()
+	}
+	api.AssertIsEqual(c.State.End, current)
 	api.AssertIsEqual(c.State.Height, 0)
 	api.AssertIsEqual(c.State.Count, 1)
 	return nil
