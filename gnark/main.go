@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/bits"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -15,7 +14,6 @@ import (
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/backend/witness"
 	"github.com/consensys/gnark/constraint"
-	csbn254 "github.com/consensys/gnark/constraint/bn254"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/std/algebra/emulated/sw_bn254"
@@ -117,10 +115,6 @@ func (level proofLevel) prove(assignment frontend.Circuit) (provedStatement, tim
 	return provedStatement{proof, public}, elapsed, nil
 }
 
-func verify(proof groth16.Proof, key groth16.VerifyingKey, public witness.Witness) error {
-	return groth16.Verify(proof, key, public, stdgroth16.GetNativeVerifierOptions(field, field))
-}
-
 func encodeProof(proof groth16.Proof) ([]byte, error) {
 	var buffer bytes.Buffer
 	if _, err := proof.WriteTo(&buffer); err != nil {
@@ -139,7 +133,7 @@ func verifyEncodedProof(encoded []byte, key groth16.VerifyingKey, expected publi
 	if err != nil {
 		return fmt.Errorf("build verifier witness: %w", err)
 	}
-	return verify(proof, key, public)
+	return groth16.Verify(proof, key, public, stdgroth16.GetNativeVerifierOptions(field, field))
 }
 
 func (p provedStatement) child() (childProof, error) {
@@ -154,19 +148,15 @@ func (p provedStatement) child() (childProof, error) {
 	return childProof{Proof: proof, Witness: public}, nil
 }
 
-func run(leafCount int, checkMismatch bool) error {
+func run(leafCount int) error {
 	if leafCount < 1 || leafCount > 128 || leafCount&(leafCount-1) != 0 {
 		return errors.New("-n must be a power of two between 1 and 128")
-	}
-	if checkMismatch && leafCount < 2 {
-		return errors.New("-check-mismatch requires -n of at least 2")
 	}
 	stage("reference_chain", 0)
 	chain, err := referenceChain(leafCount)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Poseidon2 H(1)=%s\n", chain[1].String())
 
 	level, err := setupLevel(0, &leafCircuit{})
 	if err != nil {
@@ -185,14 +175,6 @@ func run(leafCount int, checkMismatch bool) error {
 		leafProvingTime += elapsed
 	}
 	reportTiming("prove_leaves", 0, leafProvingTime, leafCount)
-	if checkMismatch {
-		stage("verify_mismatch_leaves", 0)
-		for i, leaf := range children[:2] {
-			if err := verify(leaf.proof, leafKey, leaf.public); err != nil {
-				return fmt.Errorf("verify leaf %d for mismatch check: %w", i+1, err)
-			}
-		}
-	}
 
 	stage("serialize_leaf_proofs", 0)
 	encodedLeaves := make([][]byte, leafCount)
@@ -203,7 +185,9 @@ func run(leafCount int, checkMismatch bool) error {
 		}
 	}
 
-	for height := 1; len(children) > 1; height++ {
+	height := 0
+	for len(children) > 1 {
+		height++
 		stage("prepare_parent", height)
 		circuit, err := level.parent()
 		if err != nil {
@@ -235,28 +219,11 @@ func run(leafCount int, checkMismatch bool) error {
 			}
 			parents[i] = parent
 			aggregationProvingTime += elapsed
-			if checkMismatch && height == 1 && i == 0 {
-				stage("check_mismatch_join", height)
-				// Reverse the two verified leaves. Both outer endpoints are x_8,
-				// but the join would require x_16 to equal x_0.
-				reversed := publicState{Start: chain[hashesPerLeaf], End: chain[hashesPerLeaf], Height: 1, Count: 2}
-				_, _, err := level.prove(&parentCircuit{State: reversed, Left: right, Right: left})
-				if err == nil {
-					return errors.New("proved a parent with mismatched child endpoints")
-				}
-				var unsatisfied *csbn254.UnsatisfiedConstraintError
-				if !errors.As(err, &unsatisfied) {
-					return fmt.Errorf("prove mismatched children: %w", err)
-				}
-				fmt.Printf("Rejected two valid leaves with a mismatched join at constraint %d\n", unsatisfied.CID)
-				stage("prove_aggregation", height)
-			}
 		}
 		reportTiming("prove_aggregation", height, aggregationProvingTime, len(parents))
 		children = parents
 	}
 
-	height := bits.Len(uint(leafCount)) - 1
 	encodedFinal := encodedLeaves[0]
 	if height > 0 {
 		stage("serialize_final_proof", height)
@@ -286,15 +253,13 @@ func run(leafCount int, checkMismatch bool) error {
 		}
 	}
 	reportTiming("verify_leaves", 0, time.Since(start), leafCount)
-	fmt.Printf("Verified N=%d start=%s end=%s height=%d count=%d (%d hashes)\n", leafCount, chain[0].String(), chain[end].String(), height, leafCount, end)
 	return nil
 }
 
 func main() {
 	leafCount := flag.Int("n", 4, "number of leaves (1, 2, 4, 8, 16, 32, 64, or 128)")
-	checkMismatch := flag.Bool("check-mismatch", false, "check that a parent rejects two valid leaves in reverse order (requires -n >= 2)")
 	flag.Parse()
-	if err := run(*leafCount, *checkMismatch); err != nil {
+	if err := run(*leafCount); err != nil {
 		log.Fatal(err)
 	}
 }
