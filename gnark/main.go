@@ -2,8 +2,10 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"log"
+	"math/bits"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -18,13 +20,11 @@ import (
 	stdgroth16 "github.com/consensys/gnark/std/recursion/groth16"
 )
 
-const leafCount = 4
-
 var field = ecc.BN254.ScalarField()
 
 // referenceChain computes H repeatedly, starting at 1. Each call to H hashes
 // one canonical field element from the zero initial state.
-func referenceChain() ([]fr.Element, error) {
+func referenceChain(leafCount int) ([]fr.Element, error) {
 	chain := make([]fr.Element, leafCount*hashesPerLeaf+1)
 	chain[0].SetOne()
 	hasher := poseidon2.NewMerkleDamgardHasher()
@@ -77,28 +77,24 @@ func (level proofLevel) parent() (*parentCircuit, error) {
 	return &parentCircuit{Left: placeholder(), Right: placeholder(), ChildKey: key}, nil
 }
 
-func (level proofLevel) prove(assignment frontend.Circuit) (groth16.Proof, error) {
+func (level proofLevel) prove(assignment frontend.Circuit) (provedStatement, error) {
 	full, err := frontend.NewWitness(assignment, field)
 	if err != nil {
-		return nil, fmt.Errorf("build prover witness: %w", err)
+		return provedStatement{}, fmt.Errorf("build prover witness: %w", err)
 	}
-	return groth16.Prove(level.constraints, level.provingKey, full, stdgroth16.GetNativeProverOptions(field, field))
-}
-
-func (level proofLevel) proveAndVerify(assignment frontend.Circuit, expected publicState) (provedStatement, error) {
-	proof, err := level.prove(assignment)
+	public, err := full.Public()
+	if err != nil {
+		return provedStatement{}, fmt.Errorf("extract public witness: %w", err)
+	}
+	proof, err := groth16.Prove(level.constraints, level.provingKey, full, stdgroth16.GetNativeProverOptions(field, field))
 	if err != nil {
 		return provedStatement{}, fmt.Errorf("prove: %w", err)
 	}
-	// Both circuits expose the same public inputs in the same order.
-	public, err := frontend.NewWitness(&leafCircuit{State: expected}, field, frontend.PublicOnly())
-	if err != nil {
-		return provedStatement{}, fmt.Errorf("build verifier witness: %w", err)
-	}
-	if err := groth16.Verify(proof, level.verifyingKey, public, stdgroth16.GetNativeVerifierOptions(field, field)); err != nil {
-		return provedStatement{}, fmt.Errorf("verify: %w", err)
-	}
 	return provedStatement{proof, public}, nil
+}
+
+func (level proofLevel) verify(proof groth16.Proof, public witness.Witness) error {
+	return groth16.Verify(proof, level.verifyingKey, public, stdgroth16.GetNativeVerifierOptions(field, field))
 }
 
 func (p provedStatement) child() (childProof, error) {
@@ -113,8 +109,14 @@ func (p provedStatement) child() (childProof, error) {
 	return childProof{Proof: proof, Witness: public}, nil
 }
 
-func run() error {
-	chain, err := referenceChain()
+func run(leafCount int, checkMismatch bool) error {
+	if leafCount < 1 || leafCount > 128 || leafCount&(leafCount-1) != 0 {
+		return errors.New("-n must be a power of two between 1 and 128")
+	}
+	if checkMismatch && leafCount < 2 {
+		return errors.New("-check-mismatch requires -n of at least 2")
+	}
+	chain, err := referenceChain(leafCount)
 	if err != nil {
 		return err
 	}
@@ -128,12 +130,16 @@ func run() error {
 	for i := range children {
 		start := i * hashesPerLeaf
 		state := publicState{Start: chain[start], End: chain[start+hashesPerLeaf], Height: 0, Count: 1}
-		children[i], err = level.proveAndVerify(&leafCircuit{State: state}, state)
+		children[i], err = level.prove(&leafCircuit{State: state})
 		if err != nil {
 			return fmt.Errorf("leaf %d: %w", i+1, err)
 		}
+		if checkMismatch && i < 2 {
+			if err := level.verify(children[i].proof, children[i].public); err != nil {
+				return fmt.Errorf("verify leaf %d for mismatch check: %w", i+1, err)
+			}
+		}
 	}
-	fmt.Printf("Verified N=1 start=1 end=%s height=0 count=1 (%d hashes)\n", chain[hashesPerLeaf].String(), hashesPerLeaf)
 
 	for height := 1; len(children) > 1; height++ {
 		circuit, err := level.parent()
@@ -159,14 +165,11 @@ func run() error {
 			end := start + count*hashesPerLeaf
 			state := publicState{Start: chain[start], End: chain[end], Height: height, Count: count}
 			fmt.Printf("Proving level %d proof %d of %d\n", height, i+1, len(parents))
-			parents[i], err = level.proveAndVerify(&parentCircuit{State: state, Left: left, Right: right}, state)
+			parents[i], err = level.prove(&parentCircuit{State: state, Left: left, Right: right})
 			if err != nil {
 				return fmt.Errorf("level %d proof %d: %w", height, i+1, err)
 			}
-			if i == 0 {
-				fmt.Printf("Verified N=%d start=1 end=%s height=%d count=%d (%d hashes)\n", count, chain[end].String(), height, count, end)
-			}
-			if height == 1 && i == 0 {
+			if checkMismatch && height == 1 && i == 0 {
 				// Reverse the two verified leaves. Both outer endpoints are x_8,
 				// but the join would require x_16 to equal x_0.
 				reversed := publicState{Start: chain[hashesPerLeaf], End: chain[hashesPerLeaf], Height: 1, Count: 2}
@@ -183,11 +186,27 @@ func run() error {
 		}
 		children = parents
 	}
+
+	end := len(chain) - 1
+	height := bits.Len(uint(leafCount)) - 1
+	expected := publicState{Start: chain[0], End: chain[end], Height: height, Count: leafCount}
+	// Both circuits expose the same public inputs in the same order.
+	public, err := frontend.NewWitness(&leafCircuit{State: expected}, field, frontend.PublicOnly())
+	if err != nil {
+		return fmt.Errorf("build final verifier witness: %w", err)
+	}
+	if err := level.verify(children[0].proof, public); err != nil {
+		return fmt.Errorf("verify final proof: %w", err)
+	}
+	fmt.Printf("Verified N=%d start=%s end=%s height=%d count=%d (%d hashes)\n", leafCount, chain[0].String(), chain[end].String(), height, leafCount, end)
 	return nil
 }
 
 func main() {
-	if err := run(); err != nil {
+	leafCount := flag.Int("n", 4, "number of leaves (1, 2, 4, 8, 16, 32, 64, or 128)")
+	checkMismatch := flag.Bool("check-mismatch", false, "check that a parent rejects two valid leaves in reverse order (requires -n >= 2)")
+	flag.Parse()
+	if err := run(*leafCount, *checkMismatch); err != nil {
 		log.Fatal(err)
 	}
 }
