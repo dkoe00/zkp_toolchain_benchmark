@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"math/bits"
+	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -38,6 +40,11 @@ func referenceChain(leafCount int) ([]fr.Element, error) {
 	return chain, nil
 }
 
+func leafState(chain []fr.Element, index int) publicState {
+	start := index * hashesPerLeaf
+	return publicState{Start: chain[start], End: chain[start+hashesPerLeaf], Height: 0, Count: 1}
+}
+
 type proofLevel struct {
 	constraints  constraint.ConstraintSystem
 	provingKey   groth16.ProvingKey
@@ -49,17 +56,31 @@ type provedStatement struct {
 	public witness.Witness
 }
 
+func stage(phase string, height int) {
+	fmt.Printf("stage,%s,%d\n", phase, height)
+}
+
+func reportTiming(phase string, height int, elapsed time.Duration, proofCount int) {
+	fmt.Printf("measurement,%s,%d,%d,%d,0\n", phase, height, elapsed.Nanoseconds(), proofCount)
+}
+
 func setupLevel(height int, circuit frontend.Circuit) (proofLevel, error) {
-	fmt.Printf("Compiling level %d\n", height)
+	stage("compile", height)
+	start := time.Now()
 	ccs, err := frontend.Compile(field, r1cs.NewBuilder, circuit)
+	elapsed := time.Since(start)
 	if err != nil {
 		return proofLevel{}, fmt.Errorf("compile level %d: %w", height, err)
 	}
-	fmt.Printf("Generating keys for level %d\n", height)
+	reportTiming("compile", height, elapsed, 0)
+	stage("setup", height)
+	start = time.Now()
 	pk, vk, err := groth16.Setup(ccs)
+	elapsed = time.Since(start)
 	if err != nil {
 		return proofLevel{}, fmt.Errorf("set up level %d: %w", height, err)
 	}
+	reportTiming("setup", height, elapsed, 0)
 	return proofLevel{ccs, pk, vk}, nil
 }
 
@@ -77,24 +98,48 @@ func (level proofLevel) parent() (*parentCircuit, error) {
 	return &parentCircuit{Left: placeholder(), Right: placeholder(), ChildKey: key}, nil
 }
 
-func (level proofLevel) prove(assignment frontend.Circuit) (provedStatement, error) {
+func (level proofLevel) prove(assignment frontend.Circuit) (provedStatement, time.Duration, error) {
 	full, err := frontend.NewWitness(assignment, field)
 	if err != nil {
-		return provedStatement{}, fmt.Errorf("build prover witness: %w", err)
+		return provedStatement{}, 0, fmt.Errorf("build prover witness: %w", err)
 	}
 	public, err := full.Public()
 	if err != nil {
-		return provedStatement{}, fmt.Errorf("extract public witness: %w", err)
+		return provedStatement{}, 0, fmt.Errorf("extract public witness: %w", err)
 	}
-	proof, err := groth16.Prove(level.constraints, level.provingKey, full, stdgroth16.GetNativeProverOptions(field, field))
+	options := stdgroth16.GetNativeProverOptions(field, field)
+	start := time.Now()
+	proof, err := groth16.Prove(level.constraints, level.provingKey, full, options)
+	elapsed := time.Since(start)
 	if err != nil {
-		return provedStatement{}, fmt.Errorf("prove: %w", err)
+		return provedStatement{}, 0, fmt.Errorf("prove: %w", err)
 	}
-	return provedStatement{proof, public}, nil
+	return provedStatement{proof, public}, elapsed, nil
 }
 
-func (level proofLevel) verify(proof groth16.Proof, public witness.Witness) error {
-	return groth16.Verify(proof, level.verifyingKey, public, stdgroth16.GetNativeVerifierOptions(field, field))
+func verify(proof groth16.Proof, key groth16.VerifyingKey, public witness.Witness) error {
+	return groth16.Verify(proof, key, public, stdgroth16.GetNativeVerifierOptions(field, field))
+}
+
+func encodeProof(proof groth16.Proof) ([]byte, error) {
+	var buffer bytes.Buffer
+	if _, err := proof.WriteTo(&buffer); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func verifyEncodedProof(encoded []byte, key groth16.VerifyingKey, expected publicState) error {
+	proof := groth16.NewProof(ecc.BN254)
+	if _, err := proof.ReadFrom(bytes.NewReader(encoded)); err != nil {
+		return fmt.Errorf("decode proof: %w", err)
+	}
+	// Both circuits expose the same public inputs in the same order.
+	public, err := frontend.NewWitness(&leafCircuit{State: expected}, field, frontend.PublicOnly())
+	if err != nil {
+		return fmt.Errorf("build verifier witness: %w", err)
+	}
+	return verify(proof, key, public)
 }
 
 func (p provedStatement) child() (childProof, error) {
@@ -116,6 +161,7 @@ func run(leafCount int, checkMismatch bool) error {
 	if checkMismatch && leafCount < 2 {
 		return errors.New("-check-mismatch requires -n of at least 2")
 	}
+	stage("reference_chain", 0)
 	chain, err := referenceChain(leafCount)
 	if err != nil {
 		return err
@@ -126,22 +172,39 @@ func run(leafCount int, checkMismatch bool) error {
 	if err != nil {
 		return err
 	}
+	leafKey := level.verifyingKey
 	children := make([]provedStatement, leafCount)
+	stage("prove_leaves", 0)
+	var leafProvingTime time.Duration
 	for i := range children {
-		start := i * hashesPerLeaf
-		state := publicState{Start: chain[start], End: chain[start+hashesPerLeaf], Height: 0, Count: 1}
-		children[i], err = level.prove(&leafCircuit{State: state})
+		leaf, elapsed, err := level.prove(&leafCircuit{State: leafState(chain, i)})
 		if err != nil {
 			return fmt.Errorf("leaf %d: %w", i+1, err)
 		}
-		if checkMismatch && i < 2 {
-			if err := level.verify(children[i].proof, children[i].public); err != nil {
+		children[i] = leaf
+		leafProvingTime += elapsed
+	}
+	reportTiming("prove_leaves", 0, leafProvingTime, leafCount)
+	if checkMismatch {
+		stage("verify_mismatch_leaves", 0)
+		for i, leaf := range children[:2] {
+			if err := verify(leaf.proof, leafKey, leaf.public); err != nil {
 				return fmt.Errorf("verify leaf %d for mismatch check: %w", i+1, err)
 			}
 		}
 	}
 
+	stage("serialize_leaf_proofs", 0)
+	encodedLeaves := make([][]byte, leafCount)
+	for i, leaf := range children {
+		encodedLeaves[i], err = encodeProof(leaf.proof)
+		if err != nil {
+			return fmt.Errorf("serialize leaf proof %d: %w", i+1, err)
+		}
+	}
+
 	for height := 1; len(children) > 1; height++ {
+		stage("prepare_parent", height)
 		circuit, err := level.parent()
 		if err != nil {
 			return fmt.Errorf("build level %d circuit: %w", height, err)
@@ -152,6 +215,8 @@ func run(leafCount int, checkMismatch bool) error {
 		}
 		parents := make([]provedStatement, len(children)/2)
 		count := 1 << height
+		stage("prove_aggregation", height)
+		var aggregationProvingTime time.Duration
 		for i := range parents {
 			left, err := children[2*i].child()
 			if err != nil {
@@ -164,16 +229,18 @@ func run(leafCount int, checkMismatch bool) error {
 			start := i * count * hashesPerLeaf
 			end := start + count*hashesPerLeaf
 			state := publicState{Start: chain[start], End: chain[end], Height: height, Count: count}
-			fmt.Printf("Proving level %d proof %d of %d\n", height, i+1, len(parents))
-			parents[i], err = level.prove(&parentCircuit{State: state, Left: left, Right: right})
+			parent, elapsed, err := level.prove(&parentCircuit{State: state, Left: left, Right: right})
 			if err != nil {
 				return fmt.Errorf("level %d proof %d: %w", height, i+1, err)
 			}
+			parents[i] = parent
+			aggregationProvingTime += elapsed
 			if checkMismatch && height == 1 && i == 0 {
+				stage("check_mismatch_join", height)
 				// Reverse the two verified leaves. Both outer endpoints are x_8,
 				// but the join would require x_16 to equal x_0.
 				reversed := publicState{Start: chain[hashesPerLeaf], End: chain[hashesPerLeaf], Height: 1, Count: 2}
-				_, err := level.prove(&parentCircuit{State: reversed, Left: right, Right: left})
+				_, _, err := level.prove(&parentCircuit{State: reversed, Left: right, Right: left})
 				if err == nil {
 					return errors.New("proved a parent with mismatched child endpoints")
 				}
@@ -182,22 +249,43 @@ func run(leafCount int, checkMismatch bool) error {
 					return fmt.Errorf("prove mismatched children: %w", err)
 				}
 				fmt.Printf("Rejected two valid leaves with a mismatched join at constraint %d\n", unsatisfied.CID)
+				stage("prove_aggregation", height)
 			}
 		}
+		reportTiming("prove_aggregation", height, aggregationProvingTime, len(parents))
 		children = parents
 	}
 
-	end := len(chain) - 1
 	height := bits.Len(uint(leafCount)) - 1
-	expected := publicState{Start: chain[0], End: chain[end], Height: height, Count: leafCount}
-	// Both circuits expose the same public inputs in the same order.
-	public, err := frontend.NewWitness(&leafCircuit{State: expected}, field, frontend.PublicOnly())
-	if err != nil {
-		return fmt.Errorf("build final verifier witness: %w", err)
+	encodedFinal := encodedLeaves[0]
+	if height > 0 {
+		stage("serialize_final_proof", height)
+		encodedFinal, err = encodeProof(children[0].proof)
+		if err != nil {
+			return fmt.Errorf("serialize final proof: %w", err)
+		}
 	}
-	if err := level.verify(children[0].proof, public); err != nil {
+	fmt.Printf("measurement,final_proof_size,%d,0,1,%d\n", height, len(encodedFinal))
+
+	stage("verify_final", height)
+	start := time.Now()
+	end := len(chain) - 1
+	expected := publicState{Start: chain[0], End: chain[end], Height: height, Count: leafCount}
+	err = verifyEncodedProof(encodedFinal, level.verifyingKey, expected)
+	elapsed := time.Since(start)
+	if err != nil {
 		return fmt.Errorf("verify final proof: %w", err)
 	}
+	reportTiming("verify_final", height, elapsed, 1)
+
+	stage("verify_leaves", 0)
+	start = time.Now()
+	for i, encoded := range encodedLeaves {
+		if err := verifyEncodedProof(encoded, leafKey, leafState(chain, i)); err != nil {
+			return fmt.Errorf("verify leaf proof %d: %w", i+1, err)
+		}
+	}
+	reportTiming("verify_leaves", 0, time.Since(start), leafCount)
 	fmt.Printf("Verified N=%d start=%s end=%s height=%d count=%d (%d hashes)\n", leafCount, chain[0].String(), chain[end].String(), height, leafCount, end)
 	return nil
 }
