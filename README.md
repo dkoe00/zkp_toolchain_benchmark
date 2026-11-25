@@ -44,20 +44,25 @@ leaf verifications.
 
 ### Measurement boundaries
 
-Phase durations and process wall time are recorded in nanoseconds. Leaves are
-level 0, aggregation levels are reported separately, and process metrics have
-a blank level.
+Timings are recorded in nanoseconds. `compile_setup` and `prove` span the
+whole tree and are emitted after all proofs are generated. Both totals and
+process wall time have a blank level. Leaf verification uses level 0 and
+final verification uses the root level.
 
-| Phase | What is measured |
+| Timing | What is measured |
 | --- | --- |
-| `process` | Wall time from executable launch to exit and the OS-reported peak RSS in bytes. The executable build happens before sampling. |
-| `compile`, `setup` | Circuit compilation and Groth16 key generation, timed separately at each level. |
-| `prove_leaves`, `prove_aggregation` | Proof count and the sum of prover-call times at each level. Witness preparation and child proof conversion happen outside these timers. |
-| `final_proof_size` | Byte length of gnark's serialized final proof. |
-| `verify_final`, `verify_leaves` | Proof count and verification time for the final proof and all leaves, measured separately. Both timers include proof decoding and expected public witness preparation. Keys are already in memory, and proof serialization happens beforehand. |
+| `compile_setup` | Total time for circuit compilation and Groth16 key generation across all levels. |
+| `prove` | Total prover-call time and proof count for the leaves and aggregation proofs. Witness preparation and child proof conversion happen outside the timer. |
+| Verification | Separate durations for verifying each leaf proof individually (`verify_leaves`, summed across all leaves) and verifying the single final proof (`verify_final`). |
+| Process wall time | Time from executable launch to exit (`process`, `wall_time_ns`). The executable is built before sampling. |
 
-At `N=1`, the single leaf is also the final proof and is used in both
-verification measurements.
+Both verification timers include proof decoding and preparation of the
+expected public witness. Keys are already in memory, and proof serialization
+happens beforehand. At `N=1`, both verification timings use the single leaf
+proof.
+
+The runner also records the process's peak RSS in bytes, and gnark reports
+the byte length of the serialized final proof.
 
 ### Workload
 

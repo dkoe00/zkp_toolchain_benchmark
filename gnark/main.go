@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -58,28 +59,22 @@ func stage(phase string, height int) {
 	fmt.Printf("stage,%s,%d\n", phase, height)
 }
 
-func reportTiming(phase string, height int, elapsed time.Duration, proofCount int) {
-	fmt.Printf("measurement,%s,%d,%d,%d,0\n", phase, height, elapsed.Nanoseconds(), proofCount)
+func reportTiming(phase, level string, elapsed time.Duration, proofCount int) {
+	fmt.Printf("measurement,%s,%s,%d,%d,0\n", phase, level, elapsed.Nanoseconds(), proofCount)
 }
 
-func setupLevel(height int, circuit frontend.Circuit) (proofLevel, error) {
-	stage("compile", height)
+func setupLevel(height int, circuit frontend.Circuit) (proofLevel, time.Duration, error) {
+	stage("compile_setup", height)
 	start := time.Now()
 	ccs, err := frontend.Compile(field, r1cs.NewBuilder, circuit)
-	elapsed := time.Since(start)
 	if err != nil {
-		return proofLevel{}, fmt.Errorf("compile level %d: %w", height, err)
+		return proofLevel{}, 0, fmt.Errorf("compile level %d: %w", height, err)
 	}
-	reportTiming("compile", height, elapsed, 0)
-	stage("setup", height)
-	start = time.Now()
 	pk, vk, err := groth16.Setup(ccs)
-	elapsed = time.Since(start)
 	if err != nil {
-		return proofLevel{}, fmt.Errorf("set up level %d: %w", height, err)
+		return proofLevel{}, 0, fmt.Errorf("set up level %d: %w", height, err)
 	}
-	reportTiming("setup", height, elapsed, 0)
-	return proofLevel{ccs, pk, vk}, nil
+	return proofLevel{ccs, pk, vk}, time.Since(start), nil
 }
 
 func (level proofLevel) parent() (*parentCircuit, error) {
@@ -158,23 +153,22 @@ func run(leafCount int) error {
 		return err
 	}
 
-	level, err := setupLevel(0, &leafCircuit{})
+	level, compileSetupTime, err := setupLevel(0, &leafCircuit{})
 	if err != nil {
 		return err
 	}
 	leafKey := level.verifyingKey
 	children := make([]provedStatement, leafCount)
 	stage("prove_leaves", 0)
-	var leafProvingTime time.Duration
+	var provingTime time.Duration
 	for i := range children {
 		leaf, elapsed, err := level.prove(&leafCircuit{State: leafState(chain, i)})
 		if err != nil {
 			return fmt.Errorf("leaf %d: %w", i+1, err)
 		}
 		children[i] = leaf
-		leafProvingTime += elapsed
+		provingTime += elapsed
 	}
-	reportTiming("prove_leaves", 0, leafProvingTime, leafCount)
 
 	stage("serialize_leaf_proofs", 0)
 	encodedLeaves := make([][]byte, leafCount)
@@ -193,14 +187,15 @@ func run(leafCount int) error {
 		if err != nil {
 			return fmt.Errorf("build level %d circuit: %w", height, err)
 		}
-		level, err = setupLevel(height, circuit)
+		parentLevel, elapsed, err := setupLevel(height, circuit)
 		if err != nil {
 			return err
 		}
+		level = parentLevel
+		compileSetupTime += elapsed
 		parents := make([]provedStatement, len(children)/2)
 		count := 1 << height
 		stage("prove_aggregation", height)
-		var aggregationProvingTime time.Duration
 		for i := range parents {
 			left, err := children[2*i].child()
 			if err != nil {
@@ -218,11 +213,12 @@ func run(leafCount int) error {
 				return fmt.Errorf("level %d proof %d: %w", height, i+1, err)
 			}
 			parents[i] = parent
-			aggregationProvingTime += elapsed
+			provingTime += elapsed
 		}
-		reportTiming("prove_aggregation", height, aggregationProvingTime, len(parents))
 		children = parents
 	}
+	reportTiming("compile_setup", "", compileSetupTime, 0)
+	reportTiming("prove", "", provingTime, 2*leafCount-1)
 
 	encodedFinal := encodedLeaves[0]
 	if height > 0 {
@@ -243,7 +239,7 @@ func run(leafCount int) error {
 	if err != nil {
 		return fmt.Errorf("verify final proof: %w", err)
 	}
-	reportTiming("verify_final", height, elapsed, 1)
+	reportTiming("verify_final", strconv.Itoa(height), elapsed, 1)
 
 	stage("verify_leaves", 0)
 	start = time.Now()
@@ -252,7 +248,7 @@ func run(leafCount int) error {
 			return fmt.Errorf("verify leaf proof %d: %w", i+1, err)
 		}
 	}
-	reportTiming("verify_leaves", 0, time.Since(start), leafCount)
+	reportTiming("verify_leaves", "0", time.Since(start), leafCount)
 	return nil
 }
 
